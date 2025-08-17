@@ -1,7 +1,15 @@
 # OmoluabiProductions
 
-This repository contains an image and an audio track. Use the provided script to generate a video combining them.
+This repository contains the assets for "Take The Risk":
 
-## Generate video
+- `Take The Risk.png` – cover art
+- `Take The Risk.mp3` – audio track
 
-Run `./generate_video.sh` to produce `output.mp4` using ffmpeg.
+## Regenerate the video
+
+You can recreate the `Take The Risk.mp4` video using ffmpeg. The generated video
+is ignored by git to keep the repository lightweight:
+
+```bash
+ffmpeg -loop 1 -i "Take The Risk.png" -i "Take The Risk.mp3" -c:v libx264 -tune stillimage -c:a copy -shortest -pix_fmt yuv420p "Take The Risk.mp4"
+```
