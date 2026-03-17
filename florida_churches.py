@@ -10,7 +10,7 @@ import logging
 import math
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -47,6 +47,10 @@ class ChurchRow:
     state: str
     zip: str
     county: str
+    phone: str
+    website: str
+    email: str
+    operator: str
     lat: float
     lon: float
     source: str
@@ -193,6 +197,10 @@ def church_from_element(el: dict[str, Any], verified_ts: str) -> ChurchRow | Non
     state = normalize_state(get_tag(tags, ADDRESS_KEYS["state"])) or "FL"
     zip_code = normalize_zip(get_tag(tags, ADDRESS_KEYS["zip"]))
     county = normalize_whitespace(get_tag(tags, ADDRESS_KEYS["county"]))
+    phone = normalize_whitespace(tags.get("contact:phone", "") or tags.get("phone", ""))
+    website = normalize_whitespace(tags.get("contact:website", "") or tags.get("website", ""))
+    email = normalize_whitespace(tags.get("contact:email", "") or tags.get("email", ""))
+    operator = normalize_whitespace(tags.get("operator", ""))
 
     lat = el.get("lat")
     lon = el.get("lon")
@@ -213,6 +221,10 @@ def church_from_element(el: dict[str, Any], verified_ts: str) -> ChurchRow | Non
         state=state,
         zip=zip_code,
         county=county,
+        phone=phone,
+        website=website,
+        email=email,
+        operator=operator,
         lat=float(lat),
         lon=float(lon),
         source=SOURCE_NAME,
@@ -266,16 +278,131 @@ def write_excel(output: Path, rows: list[ChurchRow], exceptions: list[tuple[Chur
     wb = Workbook()
     ws = wb.active
     ws.title = "Churches"
-    headers = ["name", "denomination", "street", "city", "state", "zip", "county", "lat", "lon", "source", "source_url", "last_verified"]
+    headers = [
+        "name",
+        "denomination",
+        "street",
+        "city",
+        "state",
+        "zip",
+        "county",
+        "phone",
+        "website",
+        "email",
+        "operator",
+        "lat",
+        "lon",
+        "source",
+        "source_url",
+        "last_verified",
+    ]
     ws.append(headers)
     for r in rows:
-        ws.append([r.name, r.denomination, r.street, r.city, r.state, r.zip, r.county, r.lat, r.lon, r.source, r.source_url, r.last_verified])
+        ws.append([
+            r.name,
+            r.denomination,
+            r.street,
+            r.city,
+            r.state,
+            r.zip,
+            r.county,
+            r.phone,
+            r.website,
+            r.email,
+            r.operator,
+            r.lat,
+            r.lon,
+            r.source,
+            r.source_url,
+            r.last_verified,
+        ])
 
     ex = wb.create_sheet("Exceptions")
     ex.append(headers + ["missing_fields"])
     for r, reason in exceptions:
-        ex.append([r.name, r.denomination, r.street, r.city, r.state, r.zip, r.county, r.lat, r.lon, r.source, r.source_url, r.last_verified, reason])
+        ex.append([
+            r.name,
+            r.denomination,
+            r.street,
+            r.city,
+            r.state,
+            r.zip,
+            r.county,
+            r.phone,
+            r.website,
+            r.email,
+            r.operator,
+            r.lat,
+            r.lon,
+            r.source,
+            r.source_url,
+            r.last_verified,
+            reason,
+        ])
     wb.save(output)
+
+
+def write_json(output: Path, rows: list[ChurchRow]) -> None:
+    output.write_text(json.dumps([asdict(row) for row in rows], indent=2), encoding="utf-8")
+
+
+@dataclass
+class FloridaChurchesAgent:
+    """Agent workflow for collecting Florida church records from Overpass."""
+
+    args: argparse.Namespace
+
+    def run(self) -> tuple[list[ChurchRow], list[tuple[ChurchRow, str]]]:
+        tiles = chunk_bbox(*FLORIDA_BBOX, self.args.tile_size)
+        if self.args.max_tiles:
+            tiles = tiles[: self.args.max_tiles]
+        state_file = Path(self.args.state_file)
+        state = load_state(state_file) if self.args.resume else {"completed": []}
+        completed = set(state.get("completed", []))
+
+        rows: list[ChurchRow] = []
+        exceptions: list[tuple[ChurchRow, str]] = []
+        exact_seen: set[tuple[str, str, str, str, str, str]] = set()
+
+        session = requests.Session()
+        cache_dir = Path(self.args.cache_dir)
+        verified_ts = datetime.now(timezone.utc).isoformat()
+
+        for idx, tile in enumerate(tiles, start=1):
+            key = tile_key(tile)
+            if key in completed:
+                logging.info("[%s/%s] Skipping completed tile %s", idx, len(tiles), key)
+                continue
+            logging.info("[%s/%s] Processing tile %s", idx, len(tiles), key)
+            data = get_cached_or_fetch(
+                session,
+                tile,
+                cache_dir=cache_dir,
+                timeout=self.args.request_timeout,
+                max_retries=self.args.max_retries,
+                backoff_base=self.args.backoff_base,
+            )
+            for element in data.get("elements", []):
+                row = church_from_element(element, verified_ts)
+                if not row:
+                    continue
+                ek = exact_key(row)
+                if ek in exact_seen:
+                    continue
+                if is_fuzzy_duplicate(row, rows):
+                    continue
+                exact_seen.add(ek)
+                rows.append(row)
+                missing = row_missing_fields(row)
+                if missing:
+                    exceptions.append((row, ",".join(missing)))
+
+            completed.add(key)
+            state["completed"] = sorted(completed)
+            save_state(state_file, state)
+            time.sleep(self.args.sleep)
+
+        return rows, exceptions
 
 
 def load_state(path: Path) -> dict[str, Any]:
@@ -292,57 +419,11 @@ def save_state(path: Path, state: dict[str, Any]) -> None:
 def main() -> None:
     args = parse_args()
     logging.basicConfig(level=getattr(logging, args.log_level), format="%(asctime)s %(levelname)s %(message)s")
-
-    tiles = chunk_bbox(*FLORIDA_BBOX, args.tile_size)
-    if args.max_tiles:
-        tiles = tiles[: args.max_tiles]
-    state_file = Path(args.state_file)
-    state = load_state(state_file) if args.resume else {"completed": []}
-    completed = set(state.get("completed", []))
-
-    rows: list[ChurchRow] = []
-    exceptions: list[tuple[ChurchRow, str]] = []
-    exact_seen: set[tuple[str, str, str, str, str, str]] = set()
-
-    session = requests.Session()
-    cache_dir = Path(args.cache_dir)
-    verified_ts = datetime.now(timezone.utc).isoformat()
-
-    for idx, tile in enumerate(tiles, start=1):
-        key = tile_key(tile)
-        if key in completed:
-            logging.info("[%s/%s] Skipping completed tile %s", idx, len(tiles), key)
-            continue
-        logging.info("[%s/%s] Processing tile %s", idx, len(tiles), key)
-        data = get_cached_or_fetch(
-            session,
-            tile,
-            cache_dir=cache_dir,
-            timeout=args.request_timeout,
-            max_retries=args.max_retries,
-            backoff_base=args.backoff_base,
-        )
-        for element in data.get("elements", []):
-            row = church_from_element(element, verified_ts)
-            if not row:
-                continue
-            ek = exact_key(row)
-            if ek in exact_seen:
-                continue
-            if is_fuzzy_duplicate(row, rows):
-                continue
-            exact_seen.add(ek)
-            rows.append(row)
-            missing = row_missing_fields(row)
-            if missing:
-                exceptions.append((row, ",".join(missing)))
-
-        completed.add(key)
-        state["completed"] = sorted(completed)
-        save_state(state_file, state)
-        time.sleep(args.sleep)
+    agent = FloridaChurchesAgent(args)
+    rows, exceptions = agent.run()
 
     write_excel(Path(args.output), rows, exceptions)
+    write_json(Path(args.output).with_suffix(".json"), rows)
     logging.info("Wrote %s rows (%s exceptions) to %s", len(rows), len(exceptions), args.output)
 
 
