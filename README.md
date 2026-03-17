@@ -25,7 +25,7 @@ python -m unittest
 
 ## Florida Churches Excel Generator (Python 3.11)
 
-This repository now includes `florida_churches.py`, a data pipeline that uses the **OpenStreetMap Overpass API** (no random site scraping) to build an Excel file of Florida churches.
+This repository now includes `florida_churches.py`, an agent-style data pipeline that uses the **OpenStreetMap Overpass API** (no random site scraping) to collect Florida churches and build export files.
 
 ### Install dependencies
 
@@ -58,7 +58,11 @@ python3.11 florida_churches.py \
 
 ### Output fields
 
-The `Churches` sheet contains:
+The script writes:
+- an Excel workbook (`--output`, default `florida_churches.xlsx`)
+- a JSON export with the same basename (for example, `florida_churches.json`)
+
+The `Churches` sheet / JSON objects contain:
 
 - `name`
 - `denomination` (from denomination-like OSM tags when present)
@@ -67,6 +71,10 @@ The `Churches` sheet contains:
 - `state`
 - `zip`
 - `county` (derived from available OSM county tags when present)
+- `phone`
+- `website`
+- `email`
+- `operator`
 - `lat`
 - `lon`
 - `source`
@@ -74,7 +82,6 @@ The `Churches` sheet contains:
 - `last_verified`
 
 Rows with incomplete key address fields are duplicated into an `Exceptions` sheet with a `missing_fields` reason.
-
 ### Data provenance and rate-limiting notes
 
 - **Source**: OpenStreetMap data via Overpass endpoint `https://overpass-api.de/api/interpreter`.
