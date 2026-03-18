@@ -1,47 +1,50 @@
-# Florida Church Agent
+# Florida Church Discovery Agent
 
-A production-grade Python discovery + scraping pipeline for building a structured church database across all 67 counties in Florida.
-
-## What this tool does
-
-The agent discovers, scrapes, normalizes, deduplicates, and exports church records from publicly accessible web pages. It is designed for ethical, maintainable automation and source-level auditability.
+Production-grade discovery and scraping pipeline for ETL GIS Consulting LLC focused on publicly accessible Florida church data across all 67 counties.
 
 ## Features
+- Layered discovery queries by county and major city hints.
+- DuckDuckGo HTML provider abstraction.
+- Requests-based fetcher with retries, delays, robots.txt best effort checks.
+- Optional Playwright fallback for JS-heavy pages.
+- Record extraction, classification, normalization, and fuzzy dedupe.
+- SQLite checkpointing for discovery/fetch/parse/export state.
+- CSV, Excel, duplicate review, failed URL, and JSON run summary exports.
+- CLI runtime independent of the optional local monitoring dashboard.
+- PyInstaller packaging for Windows executables.
 
-- County-by-county + city-level search expansion for all Florida counties
-- Layered discovery queries by denomination and location
-- Modular search provider abstraction (default: DuckDuckGo HTML provider)
-- Domain classification (official church, directory, denominational locator, miscellaneous)
-- Static fetching (`requests`) with retries, user-agent rotation, and rate limiting
-- Optional JavaScript fallback with Playwright
-- Multi-page extraction heuristics (home/contact/about/staff/visit/service pages)
-- Pydantic data models for raw and clean records
-- Normalization of state, phones, emails, denomination vocabulary, canonical websites
-- Layered deduplication (exact + fuzzy with RapidFuzz)
-- Optional geocoding providers (Nominatim, Google, Mapbox, Positionstack)
-- SQLite checkpointing and resume support
-- CSV + Excel outputs with run logs and source/duplicate audit artifacts
+## Project structure
+```text
+florida_church_agent/
+  agent/
+    ...
+  tests/
+  data/
+  main.py
+  requirements.txt
+  .env.example
+  build_exe.bat
+  church_agent.spec
+```
 
-## Installation
-
+## Setup
 ```bash
-cd florida_church_agent
 python -m venv .venv
-source .venv/bin/activate
+source .venv/bin/activate  # Windows: .venv\Scripts\activate
+pip install --upgrade pip
 pip install -r requirements.txt
 cp .env.example .env
 ```
 
-## Playwright setup
+## Configure environment
+Edit `.env` and set runtime values. Do not commit `.env`.
 
-If you use Playwright fallback:
-
+## Optional Playwright setup
 ```bash
-playwright install chromium
+python -m playwright install chromium
 ```
 
-## How to run
-
+## Run
 ```bash
 python main.py run --state Florida
 python main.py run --state Florida --max-pages 5000
@@ -50,40 +53,42 @@ python main.py run --state Florida --export csv --export excel
 python main.py resume
 python main.py summary
 python main.py counties
+python main.py serve-dashboard
 ```
 
-## Output files
-
-Generated in `data/`:
-
+## Outputs
 - `data/raw/churches_florida_raw.csv`
 - `data/cleaned/churches_florida_cleaned.csv`
 - `data/cleaned/churches_florida.xlsx`
-- `data/logs/scrape_log.txt`
 - `data/logs/failed_urls.csv`
 - `data/logs/source_summary.csv`
 - `data/logs/duplicate_review.csv`
 - `data/logs/run_summary.json`
+- `data/logs/scrape_log.txt`
 
-## Legal and ethical scraping notes
+## Build Windows executable
+```bat
+build_exe.bat
+```
+or:
+```bash
+pyinstaller --clean church_agent.spec
+```
 
-- Scrapes only publicly accessible pages
-- Does **not** bypass logins, CAPTCHAs, or access restrictions
-- Uses polite delays and rotates user agents
-- Checks `robots.txt` with best-effort handling before fetch
-- Stores only organization-level contact data relevant to church listings
+## Ethical scraping notes
+- Use only publicly available pages.
+- Respect robots and terms of service.
+- Apply conservative delays in `SAFE_MODE`.
+- Avoid collecting private or restricted data.
 
 ## Limitations
+- Heuristic extraction can miss fields on non-standard templates.
+- robots.txt checks are best-effort.
+- Directory pages may contain stale information.
+- Playwright adds heavy dependencies and runtime cost.
 
-- Search engine markup can change, requiring selector tuning
-- Some sites block bots or require JS rendering
-- Address and pastor/service extraction are heuristic and not guaranteed
-- Coverage depends on discoverability from public web sources
-
-## Ideas for scaling
-
-- Add additional search providers (SerpAPI/Bing API/custom index)
-- Add distributed queue workers (Celery/RQ/Kafka)
-- Add richer parser templates by CMS type (Wix, Squarespace, WordPress)
-- Add county/city enrichment from Census gazetteers
-- Add monitoring/metrics dashboards and quality scoring review UI
+## Future improvements
+- Add geocoding confidence and GIS-ready lat/lon columns.
+- Add first-class ArcGIS/GeoPandas export profiles.
+- Add richer denomination ontology and NER extraction.
+- Add async queue orchestration for high-volume runs.

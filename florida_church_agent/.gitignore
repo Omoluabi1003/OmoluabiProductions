@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+.venv/
+.env
+*.db
+build/
+dist/
+*.spec.bak
+.pytest_cache/
+htmlcov/
+coverage.xml
+data/raw/*.csv
+data/cleaned/*.csv
+data/cleaned/*.xlsx
+data/logs/*.csv
+data/logs/*.json
+data/logs/*.txt

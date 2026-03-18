@@ -1,275 +1,213 @@
-"""CLI entrypoint for Florida church scraping pipeline."""
+"""CLI entry point for Florida Church Discovery Agent."""
 
 from __future__ import annotations
 
+import argparse
 import json
-from datetime import datetime
-from pathlib import Path
-from typing import Optional
+import logging
+import uuid
+from datetime import datetime, timezone
 
-import typer
-from tqdm import tqdm
+from agent.cleaning.classify import classify_source
+from agent.cleaning.dedupe import dedupe_records
+from agent.cleaning.normalize import normalize_record
+from agent.config import get_config
+from agent.dashboard.server import create_app
+from agent.discovery.duckduckgo_html import DuckDuckGoHTMLProvider
+from agent.discovery.query_builder import COUNTIES_FL, build_queries
+from agent.export.csv_exporter import export_clean, export_duplicate_review, export_raw
+from agent.export.excel_exporter import export_excel
+from agent.export.run_summary import write_run_summary
+from agent.logging_config import configure_logging
+from agent.models import RunSummary, SourceAuditRecord
+from agent.scraping.extractor import extract_record
+from agent.scraping.fetcher import build_session, fetch_url
+from agent.scraping.playwright_fallback import fetch_with_playwright
+from agent.scraping.robots import can_fetch
+from agent.storage.checkpoint_db import CheckpointDB
+from agent.storage.repository import Repository
 
-from config import settings
-from src.counties import COUNTY_TO_CITIES, FLORIDA_COUNTIES, get_cities_for_county
-from src.deduplicate import deduplicate_records
-from src.discover import DiscoveryEngine, DuckDuckGoHtmlProvider
-from src.exporter import export_clean_csv, export_excel, export_logs, export_raw_csv
-from src.extractors import extract_church_record
-from src.fetcher import PageFetcher
-from src.geocode import geocode_address
-from src.logger import get_logger
-from src.models import CleanChurchRecord, RawChurchRecord, ScrapeRunSummary, SourceResult
-from src.normalize import normalize_record
-from src.parsers import parse_html, relevant_subpage_links
-from src.playwright_fetcher import PlaywrightFetcher
-from src.storage import Storage
-
-app = typer.Typer(help="Florida Church Agent CLI")
-
-
-def _paths() -> dict[str, Path]:
-    output = Path(settings.output_dir)
-    return {
-        "raw_csv": output / "raw" / "churches_florida_raw.csv",
-        "clean_csv": output / "cleaned" / "churches_florida_cleaned.csv",
-        "excel": output / "cleaned" / "churches_florida.xlsx",
-        "log": output / "logs" / "scrape_log.txt",
-        "failed": output / "logs" / "failed_urls.csv",
-        "source": output / "logs" / "source_summary.csv",
-        "dup": output / "logs" / "duplicate_review.csv",
-        "summary": output / "logs" / "run_summary.json",
-    }
+logger = logging.getLogger(__name__)
 
 
-def _needs_playwright(html: str, domain: str) -> bool:
-    js_heavy_domains = ["wixsite", "squarespace", "churchcenter", "subsplash"]
-    script_count = html.lower().count("<script")
-    if len(html) < 2500 or script_count > 50:
-        return True
-    if any(d in domain for d in js_heavy_domains):
-        return True
-    return False
+def run_pipeline(state: str, max_pages: int, use_playwright: bool, exports: set[str]) -> RunSummary:
+    config = get_config()
+    configure_logging(config.scrape_log_path, config.log_level)
+    run_id = str(uuid.uuid4())
+    started_at = datetime.now(timezone.utc)
 
+    session = build_session(config.user_agent, config.max_retries)
+    provider = DuckDuckGoHTMLProvider(session=session, timeout=config.request_timeout_seconds)
+    repo = Repository(CheckpointDB(config.sqlite_path))
 
-def _discover_urls(storage: Storage, logger, fetcher: PageFetcher, max_pages: int) -> int:
-    search_provider = DuckDuckGoHtmlProvider(fetcher)
-    engine = DiscoveryEngine(search_provider)
+    raw_records = []
+    clean_records = []
+    failures: list[dict[str, str]] = []
+    discovered_count = 0
+    fetched_count = 0
+    query_count = 0
 
-    total = 0
-    for county in tqdm(FLORIDA_COUNTIES, desc="Discovering by county"):
-        cities = get_cities_for_county(county)
-        logger.info("Discovering county=%s cities=%d", county, len(cities))
-        discovered = engine.discover(county, cities)
-        for item in discovered:
-            storage.upsert_discovered_url(item.url, item.county, item.city, item.source_type)
-            total += 1
-            if total >= max_pages:
-                return total
-    return total
+    for county, query in build_queries(state=state):
+        query_count += 1
+        try:
+            results = provider.search(query, max_results=12)
+        except Exception as exc:
+            logger.warning("Search failed for %s: %s", query, exc)
+            continue
 
+        for result in results:
+            if discovered_count >= max_pages:
+                break
+            repo.save_discovered_url(result.url, county, query, result.provider)
+            discovered_count += 1
 
-def _scrape_pending(
-    storage: Storage,
-    logger,
-    fetcher: PageFetcher,
-    use_playwright: bool,
-    max_pages: int,
-) -> tuple[list[RawChurchRecord], list[SourceResult], list[dict]]:
-    raw_records: list[RawChurchRecord] = []
-    source_results: list[SourceResult] = []
-    failed_urls: list[dict] = []
+            if not can_fetch(result.url, config.user_agent):
+                continue
+            html = fetch_url(
+                session,
+                result.url,
+                config.request_timeout_seconds,
+                config.min_delay_seconds if config.safe_mode else 0.2,
+                config.max_delay_seconds if config.safe_mode else 0.8,
+            )
+            if html is None and use_playwright:
+                import asyncio
 
-    pw = PlaywrightFetcher() if use_playwright else None
-    pending = storage.pending_urls(max_pages)
-
-    for row in tqdm(pending, desc="Scraping URLs"):
-        url = row["url"]
-        county = row["county"]
-
-        res = fetcher.fetch(url)
-        parser_used = "requests"
-        html = res.text
-
-        if use_playwright and pw and (res.error or _needs_playwright(html, row["source_type"] or "")):
-            pw_res = pw.fetch(url)
-            if pw_res.html:
-                html = pw_res.html
-                parser_used = "playwright"
-            elif res.error:
-                failed_urls.append({"url": url, "error": res.error, "county": county})
-                storage.mark_url_status(url, "failed")
-                storage.save_fetched_page(url, res.status_code, False, parser_used, res.error)
-                source_results.append(
-                    SourceResult(
-                        source_url=url,
-                        source_domain=(row["source_type"] or "unknown"),
-                        county=county,
-                        fetched_ok=False,
-                        status_code=res.status_code,
-                        parser_used=parser_used,
-                        error=res.error,
+                html = asyncio.run(fetch_with_playwright(result.url))
+            if html is None:
+                failures.append({"url": result.url, "reason": "fetch_failed"})
+                repo.set_fetch_status(
+                    SourceAuditRecord(
+                        source_url=result.url,
+                        provider=result.provider,
+                        query=query,
+                        status="failed",
+                        message="fetch_failed",
                     )
                 )
                 continue
 
-        if res.error and not html:
-            logger.warning("Failed fetch: %s | %s", url, res.error)
-            failed_urls.append({"url": url, "error": res.error, "county": county})
-            storage.mark_url_status(url, "failed")
-            storage.save_fetched_page(url, res.status_code, False, parser_used, res.error)
-            source_results.append(
-                SourceResult(
-                    source_url=url,
-                    source_domain=(row["source_type"] or "unknown"),
-                    county=county,
-                    fetched_ok=False,
-                    status_code=res.status_code,
-                    parser_used=parser_used,
-                    error=res.error,
+            fetched_count += 1
+            raw = extract_record(result.url, html, county=county, query=query, provider=result.provider)
+            raw.source_type = classify_source(raw.source_url)
+            raw_records.append(raw)
+            clean = normalize_record(raw)
+            clean_records.append(clean)
+            repo.save_clean_record(clean)
+            repo.set_fetch_status(
+                SourceAuditRecord(
+                    source_url=result.url,
+                    provider=result.provider,
+                    query=query,
+                    status="parsed",
+                    status_code=200,
                 )
             )
-            continue
 
-        try:
-            record = extract_church_record(html=html, source_url=url, county=county)
-            if record.church_name:
-                raw_records.append(record)
+        if discovered_count >= max_pages:
+            break
 
-            # expand extraction via likely subpages
-            soup = parse_html(html)
-            for sub_url in relevant_subpage_links(soup, url)[:4]:
-                sub_res = fetcher.fetch(sub_url)
-                if not sub_res.text:
-                    continue
-                sub_rec = extract_church_record(sub_res.text, sub_url, county)
-                if sub_rec.church_name:
-                    raw_records.append(sub_rec)
+    unique_records, dupes = dedupe_records(clean_records)
+    export_paths: list[str] = []
 
-            storage.mark_url_status(url, "done")
-            storage.save_fetched_page(url, res.status_code, True, parser_used, None)
-            source_results.append(
-                SourceResult(
-                    source_url=url,
-                    source_domain=(row["source_type"] or "unknown"),
-                    county=county,
-                    fetched_ok=True,
-                    status_code=res.status_code,
-                    parser_used=parser_used,
-                    records_extracted=1,
-                )
-            )
-        except Exception as exc:
-            err = str(exc)
-            logger.exception("Parse error on %s", url)
-            failed_urls.append({"url": url, "error": err, "county": county})
-            storage.mark_url_status(url, "failed")
-            storage.save_fetched_page(url, res.status_code, False, parser_used, err)
+    export_raw(raw_records, config.raw_export_path)
+    export_paths.append(str(config.raw_export_path))
+    repo.mark_export(str(config.raw_export_path))
 
-    return raw_records, source_results, failed_urls
+    if "csv" in exports:
+        export_clean(unique_records, config.clean_export_path)
+        export_paths.append(str(config.clean_export_path))
+        repo.mark_export(str(config.clean_export_path))
 
+    if "excel" in exports:
+        export_excel(unique_records, config.excel_export_path)
+        export_paths.append(str(config.excel_export_path))
+        repo.mark_export(str(config.excel_export_path))
 
-@app.command()
-def run(
-    state: str = typer.Option("Florida", help="Target state."),
-    max_pages: int = typer.Option(settings.max_pages, help="Maximum pages to discover/scrape."),
-    use_playwright: bool = typer.Option(settings.use_playwright, help="Enable Playwright fallback."),
-    export: list[str] = typer.Option(["csv", "excel"], help="Export formats: csv excel"),
-) -> None:
-    """Execute full discover -> scrape -> normalize -> dedupe -> export pipeline."""
-    if state.lower() != "florida":
-        typer.echo("This build is currently configured for Florida only.")
-        raise typer.Exit(code=1)
+    export_duplicate_review(dupes, config.duplicate_review_path)
+    export_paths.append(str(config.duplicate_review_path))
 
-    paths = _paths()
-    logger = get_logger(paths["log"])
-    storage = Storage(settings.sqlite_db_path)
-    fetcher = PageFetcher()
+    if failures:
+        import csv
 
-    run_started = datetime.utcnow()
-    logger.info("Run started for state=%s", state)
-    discovered_count = _discover_urls(storage, logger, fetcher, max_pages=max_pages)
+        with config.failed_urls_path.open("w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=["url", "reason"])
+            w.writeheader()
+            w.writerows(failures)
 
-    raw_records, source_results, failed_urls = _scrape_pending(
-        storage=storage,
-        logger=logger,
-        fetcher=fetcher,
-        use_playwright=use_playwright,
-        max_pages=max_pages,
+    summary = RunSummary(
+        run_id=run_id,
+        started_at=started_at,
+        finished_at=datetime.now(timezone.utc),
+        counties_covered=len(COUNTIES_FL),
+        queries_executed=query_count,
+        urls_discovered=discovered_count,
+        urls_fetched=fetched_count,
+        records_raw=len(raw_records),
+        records_clean=len(unique_records),
+        duplicates_removed=len(dupes),
+        failures=len(failures),
+        exports=export_paths,
+    )
+    write_run_summary(summary, config.run_summary_path)
+    config.source_summary_path.write_text(
+        "source_type,count\n" + "\n".join(
+            f"{stype},{sum(1 for r in raw_records if r.source_type == stype)}"
+            for stype in sorted(set(r.source_type for r in raw_records))
+        ),
+        encoding="utf-8",
     )
 
-    storage.save_records("raw_records", [r.model_dump(mode="json") for r in raw_records])
-
-    clean_records: list[CleanChurchRecord] = []
-    for raw in raw_records:
-        clean = normalize_record(raw)
-        if not clean:
-            continue
-        if settings.enable_geocoding and clean.street_address and clean.city and not (clean.latitude and clean.longitude):
-            full_addr = f"{clean.street_address}, {clean.city}, FL {clean.zip_code or ''}".strip()
-            lat, lon = geocode_address(full_addr)
-            clean.latitude, clean.longitude = lat, lon
-        clean_records.append(clean)
-
-    deduped, duplicate_flags = deduplicate_records(clean_records, fuzzy_threshold=settings.fuzzy_dup_threshold)
-    storage.save_records("clean_records", [r.model_dump(mode="json") for r in deduped])
-
-    export_raw_csv(raw_records, paths["raw_csv"])
-    export_clean_csv(deduped, paths["clean_csv"])
-    export_logs(failed_urls, source_results, duplicate_flags, paths["failed"], paths["source"], paths["dup"])
-
-    if "excel" in [x.lower() for x in export]:
-        export_excel(deduped, source_results, failed_urls, paths["excel"])
-
-    run_summary = ScrapeRunSummary(
-        run_started_at=run_started,
-        run_finished_at=datetime.utcnow(),
-        total_discovered_urls=discovered_count,
-        total_fetched_urls=len(source_results),
-        total_failed_urls=len(failed_urls),
-        total_raw_records=len(raw_records),
-        total_clean_records=len(deduped),
-        duplicates_flagged=len(duplicate_flags),
-        counties_processed=len(FLORIDA_COUNTIES),
-        notes=["Use selectors tuning for directories/search markup changes as needed."],
-    )
-
-    paths["summary"].parent.mkdir(parents=True, exist_ok=True)
-    paths["summary"].write_text(run_summary.model_dump_json(indent=2), encoding="utf-8")
-
-    logger.info("Run complete raw=%d clean=%d failures=%d", len(raw_records), len(deduped), len(failed_urls))
-    typer.echo("Run completed. See data/ and logs/ output folders.")
+    return summary
 
 
-@app.command()
-def resume() -> None:
-    """Resume by scraping still-pending URLs from SQLite queue."""
-    run(
-        state="Florida",
-        max_pages=settings.max_pages,
-        use_playwright=settings.use_playwright,
-        export=["csv", "excel"],
-    )
+def create_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Florida Church Discovery Agent")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    run_p = sub.add_parser("run", help="Start a new run")
+    run_p.add_argument("--state", default="Florida")
+    run_p.add_argument("--max-pages", type=int, default=get_config().default_max_pages)
+    run_p.add_argument("--use-playwright", action="store_true")
+    run_p.add_argument("--export", choices=["csv", "excel"], action="append", default=["csv", "excel"])
+
+    sub.add_parser("resume", help="Resume from current checkpoint")
+    sub.add_parser("summary", help="Print latest summary")
+    sub.add_parser("counties", help="Print Florida counties")
+    sub.add_parser("serve-dashboard", help="Run local monitoring dashboard")
+    return parser
 
 
-@app.command()
-def summary() -> None:
-    """Display high-level summary from latest run artifacts."""
-    paths = _paths()
-    if not paths["summary"].exists():
-        typer.echo("No run summary found yet.")
-        raise typer.Exit(code=0)
+def main() -> None:
+    args = create_parser().parse_args()
+    config = get_config()
 
-    data = json.loads(paths["summary"].read_text(encoding="utf-8"))
-    typer.echo(json.dumps(data, indent=2))
+    if args.command == "counties":
+        for county in COUNTIES_FL:
+            print(county)
+        return
 
+    if args.command == "summary":
+        if config.run_summary_path.exists():
+            print(config.run_summary_path.read_text(encoding="utf-8"))
+        else:
+            print("No summary found")
+        return
 
-@app.command()
-def counties() -> None:
-    """List all configured Florida counties and starter cities."""
-    for county in FLORIDA_COUNTIES:
-        typer.echo(f"{county}: {', '.join(COUNTY_TO_CITIES.get(county, []))}")
+    if args.command == "serve-dashboard":
+        app = create_app(config)
+        app.run(host=config.dashboard_host, port=config.dashboard_port, debug=False)
+        return
+
+    if args.command in {"run", "resume"}:
+        summary = run_pipeline(
+            state=getattr(args, "state", "Florida"),
+            max_pages=getattr(args, "max_pages", config.default_max_pages),
+            use_playwright=getattr(args, "use_playwright", False) or config.playwright_enabled,
+            exports=set(getattr(args, "export", ["csv", "excel"])),
+        )
+        print(json.dumps(summary.model_dump(mode="json"), indent=2))
 
 
 if __name__ == "__main__":
-    app()
+    main()

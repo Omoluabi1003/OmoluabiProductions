@@ -1,0 +1,4 @@
+body { font-family: Arial, sans-serif; background: #f7f7f9; color: #1f2937; }
+.container { max-width: 960px; margin: 24px auto; padding: 0 16px; }
+.card { background: white; border: 1px solid #e5e7eb; border-radius: 8px; margin-bottom: 16px; padding: 16px; }
+pre { background: #0f172a; color: #f1f5f9; padding: 12px; border-radius: 6px; max-height: 320px; overflow: auto; }
