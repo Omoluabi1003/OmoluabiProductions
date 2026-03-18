@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>{{ app_name }} Dashboard</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}" />
+  </head>
+  <body>
+    <main class="container">
+      <h1>{{ app_name }} Monitor</h1>
+      <section class="card">
+        <h2>Artifacts</h2>
+        <ul>
+          <li>SQLite: {{ db_path }}</li>
+          <li>Raw CSV: {{ raw_path }}</li>
+          <li>Clean CSV: {{ clean_path }}</li>
+          <li>Excel: {{ excel_path }}</li>
+          <li>Failed URLs: {{ failed_path }}</li>
+          <li>Run Summary: {{ summary_path }}</li>
+        </ul>
+      </section>
+      <section class="card">
+        <h2>Recent Logs</h2>
+        <pre id="logs">{{ recent_logs }}</pre>
+      </section>
+    </main>
+    <script src="{{ url_for('static', filename='app.js') }}"></script>
+  </body>
+</html>
