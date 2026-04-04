@@ -1,90 +1,102 @@
-# Ariyo-Style CLI Chatbot
+# Florida Churches Data Pipeline (Python 3.11+)
 
-A conversation-only chatbot with a warm, respectful tone and session memory.
+This project builds an audit-friendly master spreadsheet of Florida churches by combining:
 
-## How to run
+1. **Florida Sunbiz** entity-name search records (official Florida Division of Corporations search pages)
+2. **IRS exempt organization** records (from bulk file input)
+3. **OpenStreetMap (Overpass)** mapped church locations
 
-```bash
-python main.py
-```
+## Project structure
 
-## How to run tests
+- `main.py`
+- `config.py`
+- `requirements.txt`
+- `collectors/sunbiz.py`
+- `collectors/irs.py`
+- `collectors/osm.py`
+- `transform/normalize.py`
+- `transform/match.py`
+- `export/write_excel.py`
 
-```bash
-python -m unittest
-```
-
-## How to add a new intent and response rule
-
-1. Add a new intent name and keyword rules in `bot/intents.py` inside `IntentDetector.intent_rules`.
-2. Add a response template in `bot/persona.py` inside `AriyoPersona.responses`, or add special handling in
-   `AriyoPersona.generate_response` if the intent needs dynamic content.
-3. Add or update tests in `tests/test_intents.py` to cover the new intent.
-
----
-
-## Florida Churches Excel Generator (Python 3.11)
-
-This repository now includes `florida_churches.py`, an agent-style data pipeline that uses the **OpenStreetMap Overpass API** (no random site scraping) to collect Florida churches and build export files.
-
-### Install dependencies
+## Setup
 
 ```bash
-python3.11 -m pip install -r requirements-florida-churches.txt
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
 ```
 
-### Run
+## CLI usage
 
 ```bash
-python3.11 florida_churches.py --tile-size 0.5 --output florida_churches.xlsx
+python main.py --run-all --output ./output
+python main.py --sunbiz-only --output ./output
+python main.py --irs-only --irs-bulk-file ./data/irs_eo_bmf.csv --output ./output
+python main.py --osm-only --output ./output
 ```
 
-### Useful options
+## Output files
 
-```bash
-python3.11 florida_churches.py \
-  --tile-size 0.4 \
-  --cache-dir .cache/overpass \
-  --state-file .cache/florida_progress.json \
-  --resume \
-  --max-retries 5 \
-  --backoff-base 2 \
-  --sleep 1.2
-```
+The pipeline writes the following files into the output folder:
 
-- `--tile-size`: controls Florida bounding-box tiling granularity (smaller tiles reduce API payload size).
-- `--resume`: reuses the state file and skips already-completed tiles.
-- Cache is stored as per-tile JSON responses in `--cache-dir`.
+1. `Florida_Churches_Master.xlsx`
+2. `Florida_Churches_Master.csv`
+3. `Florida_Churches_Sunbiz_Raw.csv`
+4. `Florida_Churches_IRS_Raw.csv`
+5. `Florida_Churches_OSM_Raw.csv`
+6. `Florida_Churches_Duplicate_Review.xlsx`
+7. `Florida_Churches_Unmatched_Review.xlsx`
+8. `Florida_Churches_Run_Log.txt`
 
-### Output fields
+## Source contributions and limitations
 
-The script writes:
-- an Excel workbook (`--output`, default `florida_churches.xlsx`)
-- a JSON export with the same basename (for example, `florida_churches.json`)
+### Sunbiz
+- Contributes Florida entity registration context and status.
+- Uses official name-search pages from the Division of Corporations.
+- Limitation: HTML layout can change; principal/mailing/type/date completeness varies.
 
-The `Churches` sheet / JSON objects contain:
+### IRS
+- Contributes tax-exempt organization metadata such as EIN, subsection, foundation, ruling date, and revocation signal.
+- Designed for IRS bulk files when available locally.
+- Limitation: if no bulk file is provided, IRS raw output is empty by design.
 
-- `name`
-- `denomination` (from denomination-like OSM tags when present)
-- `street`
-- `city`
-- `state`
-- `zip`
-- `county` (derived from available OSM county tags when present)
-- `phone`
-- `website`
-- `email`
-- `operator`
-- `lat`
-- `lon`
-- `source`
-- `source_url`
-- `last_verified`
+### OSM
+- Contributes physical mapped place-of-worship points and coordinates for spatial enrichment.
+- Uses Overpass query for Florida `amenity=place_of_worship` + `religion=christian`.
+- Limitation: crowd-sourced data can be incomplete or inconsistent.
 
-Rows with incomplete key address fields are duplicated into an `Exceptions` sheet with a `missing_fields` reason.
-### Data provenance and rate-limiting notes
+## Matching logic
 
-- **Source**: OpenStreetMap data via Overpass endpoint `https://overpass-api.de/api/interpreter`.
-- `source_url` points to the canonical OSM object URL for each record.
-- Overpass is community infrastructure; use conservative request rates (`--sleep`) and retries with backoff.
-- Cached tile responses reduce repeat load and improve reproducibility.
+Records are matched via:
+1. exact normalized name
+2. fuzzy name similarity
+3. city / ZIP comparison
+4. coordinate proximity
+
+A score from 0-100 is written to **Match Confidence Score** and low-confidence rows are flagged for review.
+
+## Updating keyword lists
+
+Update `SUNBIZ_KEYWORDS` in `config.py` and rerun the pipeline.
+
+## Spreadsheet usage
+
+Open `Florida_Churches_Master.xlsx` and use:
+- **Master** for final reconciled records
+- **Raw** tabs for source-level audit trail
+- **Duplicate Review** and **Unmatched Review** tabs for manual QA
+- **Data Dictionary** tab for field definitions
+
+## ArcGIS Pro import guidance
+
+1. For tabular import: use `Florida_Churches_Master.csv` in **Add Data**.
+2. For map points: set X=`Longitude`, Y=`Latitude`, coordinate system WGS84 (EPSG:4326).
+3. For preserving formatting/review tabs, use `Florida_Churches_Master.xlsx` as a workbook source.
+
+## Reproducibility / governance
+
+- Deterministic sorting before export
+- Intermediate raw source CSV files preserved
+- Run log persisted
+- No fabrication of missing county/denomination/tax values
+- Source provenance stored in `Raw Source URLs`
