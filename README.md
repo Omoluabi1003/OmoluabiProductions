@@ -1,5 +1,19 @@
 # Florida Churches Data Pipeline (Python 3.11+)
 
+## Project at a glance
+
+**Category:** Florida churches data integration pipeline  
+**Purpose:** Combine Florida corporate records, IRS nonprofit extracts and OpenStreetMap records into auditable export files  
+**Intended readers:** Users, contributors, reviewers and partners  
+**Source:** https://github.com/Omoluabi1003/OmoluabiProductions
+
+**Scope and readiness:** Datasets have different coverage and matching uncertainty; output should be reviewed before use as an authoritative registry.
+
+Refer to the implementation and testing sections below for supported workflows. Planned capabilities are not production guarantees.
+
+---
+
+
 This project builds an audit-friendly master spreadsheet of Florida churches by combining:
 
 1. **Florida Sunbiz** entity-name search records (official Florida Division of Corporations search pages)
